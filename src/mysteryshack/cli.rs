@@ -4,42 +4,43 @@ use std::str::FromStr;
 
 use sodiumoxide;
 
-use clap::{App, Arg, SubCommand, AppSettings};
+use clap::{Command, Arg};
 
-use config;
-use models;
-use web;
-use utils;
+use crate::config;
+use crate::models;
+use crate::web;
+use crate::utils;
 
 
-pub fn main() {
+#[rocket::main]
+async fn main() {
     let username_arg = Arg::with_name("USERNAME")
         .help("The username to perform the operation with.")
         .required(true)
         .index(1);
 
     let matches =
-        App::new("mysteryshack")
+        Command::new("mysteryshack")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Markus Unterwaditzer & contributors")
         .about("A remoteStorage server.")
         .args_from_usage("-c, --config=[FILE] 'Use specified config file, defaults to ./config'")
-        .setting(AppSettings::SubcommandRequired)
-        .subcommand(SubCommand::with_name("serve")
+        .setting(Command::subcommand_required)
+        .subcommand(Command::with_name("serve")
                     .about("Start server"))
-        .subcommand(SubCommand::with_name("user")
+        .subcommand(Command::with_name("user")
                     .about("User management")
-                    .setting(AppSettings::SubcommandRequired)
-                    .subcommand(SubCommand::with_name("create")
+                    .setting(Command::subcommand_required)
+                    .subcommand(Command::with_name("create")
                                 .about("Create a new user")
                                 .arg(username_arg.clone()))
-                    .subcommand(SubCommand::with_name("setpass")
+                    .subcommand(Command::with_name("setpass")
                                 .about("Change password for user")
                                 .arg(username_arg.clone()))
-                    .subcommand(SubCommand::with_name("delete")
+                    .subcommand(Command::with_name("delete")
                                 .about("Delete a user")
                                 .arg(username_arg.clone()))
-                    .subcommand(SubCommand::with_name("authorize")
+                    .subcommand(Command::with_name("authorize")
                                 .about("Create a OAuth token. This is mostly useful for development.")
                                 .arg(username_arg.clone())
                                 .arg(Arg::with_name("days")

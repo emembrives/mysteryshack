@@ -12,7 +12,6 @@ use serde_json;
 use base64;
 
 use rand;
-use rand::Rng;
 
 use regex;
 
@@ -24,9 +23,9 @@ use filetime;
 use nix::errno;
 
 use url;
-use utils;
-use utils::ServerError;
-use web::oauth::{PermissionsMap, Session as OauthSession, CategoryPermissions};
+use crate::utils;
+use crate::utils::ServerError;
+use crate::web::oauth::{PermissionsMap, Session as OauthSession, CategoryPermissions};
 
 pub fn is_safe_identifier(string: &str) -> bool {
     regex::Regex::new(r"^[A-Za-z0-9_-]+$").unwrap().is_match(string)
@@ -36,11 +35,11 @@ quick_error! {
     #[derive(Debug)]
     pub enum Error {
         InvalidUserName {
-            description("Invalid chars in username. Allowed are numbers (0-9), letters (a-zA-Z), \
+            display("Invalid chars in username. Allowed are numbers (0-9), letters (a-zA-Z), \
                         `_` and `-`.")
         }
         AlreadyExisting {
-            description("Resource already exists.")
+            display("Resource already exists.")
         }
     }
 }
@@ -73,29 +72,29 @@ impl User {
     }
 
     pub fn create(basepath: &path::Path, userid: &str) -> Result<User, ServerError> {
-        let user = try!(User::new_unchecked(basepath, userid));
+        let user = User::new_unchecked(basepath, userid)?;
         if user.user_path.exists() {
             return Err(Error::AlreadyExisting.into());
         };
 
-        try!(fs::create_dir_all(user.data_path()));
-        try!(fs::create_dir_all(user.meta_path()));
-        try!(fs::create_dir_all(user.tmp_path()));
-        try!(fs::create_dir_all(user.apps_path()));
-        try!(fs::File::create(user.user_info_path()));
-        try!(user.new_key());
+        fs::create_dir_all(user.data_path())?;
+        fs::create_dir_all(user.meta_path())?;
+        fs::create_dir_all(user.tmp_path())?;
+        fs::create_dir_all(user.apps_path())?;
+        fs::File::create(user.user_info_path())?;
+        user.new_key()?;
         Ok(user)
     }
 
     pub fn delete(self) -> io::Result<()> {
-        try!(fs::remove_dir_all(self.user_path));
+        fs::remove_dir_all(self.user_path)?;
         Ok(())
     }
 
     pub fn get_password_hash(&self) -> Result<PasswordHash, ServerError> {
-        let mut f = try!(fs::File::open(self.password_path()));
+        let mut f = fs::File::open(self.password_path())?;
         let mut x: Vec<u8> = vec![];
-        try!(f.read_to_end(&mut x));
+        f.read_to_end(&mut x)?;
         Ok(PasswordHash {
             content: pwhash::HashedPassword::from_slice(&x).unwrap()
         })
@@ -103,7 +102,7 @@ impl User {
 
     pub fn set_password_hash(&self, hash: PasswordHash) -> io::Result<()> {
         let f = atomicwrites::AtomicFile::new(self.password_path(), atomicwrites::AllowOverwrite);
-        try!(f.write(|f| f.write_all(&hash.content[..])));
+        f.write(|f| f.write_all(&hash.content[..]))?;
         Ok(())
     }
 
@@ -118,9 +117,9 @@ impl User {
 
     pub fn walk_apps(&self) -> io::Result<Vec<App>> {
         let mut rv = vec![];
-        for entry in try!(fs::read_dir(self.apps_path())) {
-            let entry = try!(entry);
-            if try!(entry.metadata()).is_dir() {
+        for entry in fs::read_dir(self.apps_path())? {
+            let entry = entry?;
+            if entry.metadata()?.is_dir() {
                 rv.push(
                     App::get(
                         self,
@@ -164,10 +163,10 @@ impl User {
     pub fn new_key(&self) -> io::Result<()> {
         let key = auth::gen_key();
         let f = atomicwrites::AtomicFile::new(self.key_path(), atomicwrites::AllowOverwrite);
-        try!(f.write(|f| f.write_all(&key.0)));
+        f.write(|f| f.write_all(&key.0))?;
 
-        for app in try!(self.walk_apps()) {
-            try!(app.delete());
+        for app in self.walk_apps()? {
+            app.delete()?;
         };
 
         Ok(())
@@ -224,19 +223,19 @@ impl<'a> App<'a> {
 
     pub fn create(u: &'a User, client_id: &str) -> Result<App<'a>, io::Error> {
         let app_id = {
-            let mut rng = try!(rand::OsRng::new());
+            let mut rng = rand::rngs::OsRng::new()?;
             String::from_iter(rng.gen_ascii_chars().take(64))
         };
 
         let p = App::get_path(u, client_id);
-        try!(fs::create_dir_all(&p));
+        fs::create_dir_all(&p)?;
 
         let f = atomicwrites::AtomicFile::new(
             p.join("app_id"),
             atomicwrites::DisallowOverwrite
         );
 
-        try!(f.write(|f| f.write_all(app_id.as_bytes())));
+        f.write(|f| f.write_all(app_id.as_bytes()))?;
 
         Ok(App {
             user: u,
@@ -298,7 +297,7 @@ impl Token {
         };
 
         if let Some(exp) = token.exp {
-            let now = chrono::UTC::now().timestamp();
+            let now = chrono::offset::Utc::now().timestamp();
             if exp < now {
                 return None;
             }
@@ -318,7 +317,7 @@ impl Token {
     pub fn create(u: &User, sess: OauthSession, days: Option<u64>) -> Result<(App, Self), ServerError> {
         let app = match App::get(u, &sess.client_id) {
             Some(x) => x,
-            None => try!(App::create(u, &sess.client_id))
+            None => App::create(u, &sess.client_id)?
         };
 
         let app_id_cp = app.app_id.clone();
@@ -328,7 +327,7 @@ impl Token {
             client_id: sess.client_id,
             permissions: sess.permissions,
             exp: days.map(|d| {
-                (chrono::UTC::now() + chrono::Duration::days(d as i64)).timestamp()
+                (chrono::offset::Utc::now() + chrono::Duration::days(d as i64)).timestamp()
             })
         }))
     }
@@ -386,7 +385,7 @@ pub trait UserNode<'a> {
 
     // Get etag
     fn read_etag(&self) -> Result<String, ServerError> {
-        let metadata = try!(fs::metadata(&self.get_fs_path()));
+        let metadata = fs::metadata(&self.get_fs_path())?;
         Ok(format!("{}", metadata.mtime_nsec()))
     }
 }
@@ -414,8 +413,8 @@ impl<'a> UserFile<'a> {
     }
 
     pub fn create(&self) -> io::Result<atomicwrites::AtomicFile> {
-        try!(fs::create_dir_all(self.data_path.parent().unwrap()));
-        try!(fs::create_dir_all(self.meta_path.parent().unwrap()));
+        fs::create_dir_all(self.data_path.parent().unwrap())?;
+        fs::create_dir_all(self.meta_path.parent().unwrap())?;
 
         Ok(atomicwrites::AtomicFile::new_with_tmpdir(
             &self.data_path,
@@ -425,7 +424,7 @@ impl<'a> UserFile<'a> {
     }
 
     pub fn write_meta(&self, meta: UserFileMeta) -> Result<(), ServerError> {
-        try!(utils::write_json_file(meta, &self.meta_path));
+        utils::write_json_file(meta, &self.meta_path)?;
         match self.touch_parents() {
             Ok(_) => (),
             Err(e) => println!("Failed to touch parent directories: {:?}", e)
@@ -436,7 +435,7 @@ impl<'a> UserFile<'a> {
     fn touch_parents(&self) -> io::Result<()> {
         let timestamp = {
             // Stolen from https://github.com/uutils/coreutils/blob/master/src/touch/touch.rs
-            let t = time::now().to_timespec();
+            let t = time::Instant::now().to_timespec();
             filetime::FileTime::from_seconds_since_1970(
                 t.sec as u64,
                 t.nsec as u32
@@ -464,10 +463,10 @@ impl<'a> UserFile<'a> {
             }
         }
 
-        try!(fs::remove_file(&self.data_path));
-        try!(fs::remove_file(&self.meta_path));
-        try!(utils::map_parent_dirs(&self.data_path, self.user.data_path(), f));
-        try!(utils::map_parent_dirs(&self.meta_path, self.user.meta_path(), f));
+        fs::remove_file(&self.data_path);
+        fs::remove_file(&self.meta_path);
+        utils::map_parent_dirs(&self.data_path, self.user.data_path(), f);
+        utils::map_parent_dirs(&self.meta_path, self.user.meta_path(), f);
         Ok(())
     }
 }
@@ -501,11 +500,11 @@ impl<'a> UserNode<'a> for UserFile<'a> {
     fn get_fs_path(&self) -> &path::Path { self.data_path.as_path() }
     
     fn json_repr(&self) -> Result<serde_json::Value, ServerError> {
-        let meta = try!(self.read_meta());
+        let meta = self.read_meta();
         Ok(json!({
             "Content-Type": meta.content_type,
             "Content-Length": meta.content_length,
-            "ETag": try!(self.read_etag())
+            "ETag": self.read_etag()
         }))
     }
 }
@@ -517,12 +516,12 @@ pub struct UserFolder<'a> {
 }
 
 impl<'a> UserFolder<'a> {
-    pub fn read_children<'b>(&'b self) -> Result<Vec<Box<UserNode + 'b>>, ServerError> {
+    pub fn read_children<'b>(&'b self) -> Result<Vec<Box<dyn UserNode + 'b>>, ServerError> {
         let mut rv: Vec<Box<UserNode>> = vec![];
-        for entry in try!(fs::read_dir(&self.data_path)) {
-            let entry = try!(entry);
+        for entry in fs::read_dir(&self.data_path)? {
+            let entry = entry?;
             let path = entry.path();
-            let meta = try!(fs::metadata(&path));
+            let meta = fs::metadata(&path)?;
             let fname_string = entry.file_name();
             let fname_str = fname_string.to_str().unwrap();
 
@@ -568,7 +567,7 @@ impl<'a> UserNode<'a> for UserFolder<'a> {
 
     fn json_repr(&self) -> Result<serde_json::Value, ServerError> {
         Ok(json!({
-            "ETag": try!(self.read_etag())
+            "ETag": self.read_etag()?
         }))
     }
 }
@@ -577,9 +576,9 @@ impl<'a> UserNode<'a> for UserFolder<'a> {
 mod tests {
     use super::*;
     use utils::ServerError;
-    use web::oauth::Session as OauthSession;
-    use web::oauth::CategoryPermissions;
-    use web::oauth::PermissionsMap;
+    use crate::web::oauth::Session as OauthSession;
+    use crate::web::oauth::CategoryPermissions;
+    use crate::web::oauth::PermissionsMap;
     use tempdir::TempDir;
     use std::collections;
 

@@ -5,7 +5,7 @@ use std::io;
 use std::path;
 
 use atomicwrites;
-use models;
+use crate::models;
 
 use url;
 
@@ -23,26 +23,22 @@ quick_error! {
     pub enum ServerError {
         Io(error: io::Error) {
             display("{}", error)
-            description(error.description())
-            cause(error)
+            source(error)
             from()
         }
         Json(error: serde_json::Error) {
             display("{}", error)
-            description(error.description())
-            cause(error)
+            source(error)
             from()
         }
         Config(error: toml::de::Error) {
             display("{}", error)
-            description(error.description())
-            cause(error)
+            source(error)
             from()
         }
         Model(error: models::Error) {
             display("{}", error)
-            description(error.description())
-            cause(error)
+            source(error)
             from()
         }
     }
@@ -87,7 +83,7 @@ pub fn double_password_prompt<T: AsRef<str>>(text: T) -> Option<String> {
     fn read_passwd<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<Option<String>> {
         let _raw = writer.into_raw_mode();
         reader.read_line()
-    };
+    }
 
     macro_rules! p {
         ($text:expr) => {{
@@ -138,9 +134,9 @@ pub fn prompt_confirm<T: AsRef<str>>(question: T, default: bool) -> bool {
     };
 }
 
-pub fn read_json_file<T: Deserialize, P: AsRef<path::Path>>(p: P) -> Result<T, ServerError> {
-    let mut f = try!(fs::File::open(p.as_ref()));
-    Ok(try!(serde_json::from_reader(&mut f)))
+pub fn read_json_file<'a, T: Deserialize<'a>, P: AsRef<path::Path>>(p: P) -> Result<T, ServerError> {
+    let mut f = fs::File::open(p.as_ref())?;
+    Ok(serde_json::from_reader(&mut f)?)
 }
 
 pub fn write_json_file<T: Serialize, P: AsRef<path::Path>>(t: T, p: P) -> Result<(), ServerError> {
@@ -177,7 +173,7 @@ pub fn map_parent_dirs<F, A, B>(f_path: A, until: B, f: F)
             break;
         }
 
-        if !try!(f(cur_dir)) {
+        if !f(cur_dir)? {
             break;
         }
     };

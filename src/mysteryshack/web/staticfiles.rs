@@ -1,40 +1,26 @@
 // Generated using scripts/make_static.py. Do NOT edit directly!
 
-use router::Router;
-use hyper::header;
-use iron::prelude::*;
-use iron::modifiers::Header;
-use iron::status;
+use rocket::{Route, http::ContentType};
+use rust_embed::RustEmbed;
+use rocket::http::Method::Get;
 
-pub fn get_static_handler() -> Router {
-    let mut r = Router::new();
-    r.get("/app.css", (|_: &mut Request|
-        Ok(Response::with((
-            status::Ok,
-            Header(header::ContentType("text/css".parse().unwrap())),
-            &include_bytes!("../../static/app.css")[..]
-        )))), "app.css"
-    );
-    r.get("/app.svg", (|_: &mut Request|
-        Ok(Response::with((
-            status::Ok,
-            Header(header::ContentType("image/svg+xml".parse().unwrap())),
-            &include_bytes!("../../static/app.svg")[..]
-        )))), "app.svg"
-    );
-    r.get("/logo.svg", (|_: &mut Request|
-        Ok(Response::with((
-            status::Ok,
-            Header(header::ContentType("image/svg+xml".parse().unwrap())),
-            &include_bytes!("../../static/logo.svg")[..]
-        )))), "logo.svg"
-    );
-    r.get("/pure-min.css", (|_: &mut Request|
-        Ok(Response::with((
-            status::Ok,
-            Header(header::ContentType("text/css".parse().unwrap())),
-            &include_bytes!("../../static/pure-min.css")[..]
-        )))), "pure-min.css"
-    );
-    r
+#[derive(RustEmbed)]
+#[folder = "src/static/"]
+struct Asset;
+
+pub fn generate_static_routes() -> Vec<Route> {
+    let mut routes = Vec::<Route>::new();
+    for file in Asset::iter() {
+        let content_type = match file.split(".").last() {
+            Some("css") => ContentType::CSS,
+            Some("svg") => ContentType::SVG,
+            _ => panic!("Unknown file type")
+        };
+        routes.push(
+            Route::new(Get, "/" + file, |content_type, file| {
+                (content_type, Asset::get(file))
+            })
+        )
+    }
+    routes
 }

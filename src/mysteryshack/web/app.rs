@@ -3,45 +3,39 @@ use std::io;
 use std::fs;
 use std::ops::Deref;
 use std::error::Error;
-use std::str::FromStr;
+use std::path::PathBuf;
 
 use hyper::header;
 
-use iron;
-
-use iron::prelude::*;
-use iron::modifiers::{Header,Redirect};
-use iron::status;
-use iron::method::Method;
-use iron::typemap::Key;
-
-
 use persistent;
-use handlebars_iron::Template;
-use mount;
 use iron_sessionstorage::{Value,SessionStorage};
 use iron_sessionstorage::backends::SignedCookieBackend;
 use iron_sessionstorage::traits::*;
 
+use rocket::Request;
+use rocket::http::ContentType;
+use rocket::http::Status;
+use rocket::request;
+use rocket::response::status;
+use rocket_dyn_templates::Template;
 use urlencoded;
-use router::Router;
-use iron_error_router as error_router;
 
 use url;
 use rand;
-use rand::Rng;
 use webicon;
 
 use serde_json;
 
-use models;
-use models::UserNode;
-use config;
+use crate::models;
+use crate::models::UserNode;
+use crate::config;
+
+
 use super::utils::{preconditions_ok,EtagMatcher,SecurityHeaderMiddleware,XForwardedMiddleware,FormDataHelper,get_account_id};
 use super::oauth;
 use super::oauth::HttpResponder;
-use super::templates::get_template_engine;
-use super::staticfiles::get_static_handler;
+use super::staticfiles::generate_static_routes;
+use super::storage::*;
 
 #[derive(Copy, Clone)]
 pub struct AppConfig;
@@ -59,7 +53,7 @@ macro_rules! require_login_as {
                      "prefill_user" => $expect_user)
         }))));
 
-        match try!($req.session().get::<Login>()).map(|l| l.verify($req)) {
+        match $req.session().get::<Login>()?.map(|l| l.verify($req)) {
             Some(Login::Verified(user)) => {
                 if $expect_user.len() == 0 || &user.userid[..] == $expect_user {
                     user
@@ -107,141 +101,79 @@ impl iron::middleware::AfterMiddleware for ErrorPrinter {
     }
 }
 
-macro_rules! myrouter {
-    ($($method:ident $glob:expr => $handler:ident),* $(,)*) => (
-        router!(
-            $($handler: $method $glob => $handler,)*
-        )
+// Routes mounted on /
+
+#[options("/<_..>")]
+fn cors() -> Status { Status::Ok }
+
+#[get("/")]
+fn index() -> Template { 
+    Template::render("index", json!({}))
+}
+
+#[get("/.well-known/webfinger?<query..>")]
+fn webfinger_response(query: collections::BTreeMap<str, str>) -> (Status, (ContentType, String)) {
+    let userid = match query.get("resource")
+        .and_then(|x| if x.starts_with("acct:") {
+            Some(&x[5..x.find('@').unwrap_or(x.len())])
+        } else {
+            None
+        }) {
+            Some(o) => o,
+            None => return Status::Ok,
+        };
+
+    let storage_url = uri!(get_storage_root(userid=userid, path=()));
+    let oauth_url = uri!(request, "oauth_entry", "userid" => userid);
+
+    let mut json = serde_json::Map::new();
+    json.insert("links".to_owned(), {
+        let mut rv = vec![];
+        // We need to provide an older webfinger response because remoteStorage.js doesn't
+        // support newer ones.
+        // https://github.com/remotestorage/remotestorage.js/pull/899
+        // https://github.com/silverbucket/webfinger.js/pull/11
+        for &(rel, version) in &[
+            ("http://tools.ietf.org/id/draft-dejong-remotestorage", "draft-dejong-remotestorage-05"),
+            ("remotestorage", "draft-dejong-remotestorage-02")
+        ] {
+            rv.push(json!({
+                "href": storage_url.as_ref().as_str(),
+                "rel": rel,
+                "properties": {
+                    // Spec version
+                    "http://remotestorage.io/spec/version": version,
+
+                    // OAuth as in draft-06
+                    "http://tools.ietf.org/html/rfc6749#section-4.2": oauth_url.as_ref().as_str(),
+
+                    // No support for providing the access token via URL query param as in
+                    // draft-06
+                    "http://tools.ietf.org/html/rfc6750#section-2.3": (),
+
+                    // No Content-Range as in draft-02
+                    "http://tools.ietf.org/html/rfc2616#section-14.16": (),
+
+                    // No Content-Range as in draft-06
+                    "http://tools.ietf.org/html/rfc7233": (),
+
+                    // No web authoring as in draft-06
+                    "http://remotestorage.io/spec/web-authoring": ()
+                }
+            }));
+        };
+        serde_json::Value::Array(rv)
+    });
+
+    (Status::Ok,
+        (ContentType::new("application", "jrd+json"),
+        serde_json::to_string(&json).unwrap())
     )
 }
 
-pub fn run_server(config: config::Config) {
-    fn cors(_: &mut Request) -> IronResult<Response> { Ok(Response::with(status::Ok)) };
-    fn index(_: &mut Request) -> IronResult<Response> { 
-        Ok(Response::with((status::Ok, Template::new("index", json!({})))))
-    }
-    fn storage_root(r: &mut Request) -> IronResult<Response> { user_node_response(r) }
-
-    let router = myrouter! {
-        options "*" => cors,
-        get "/.well-known/webfinger" => webfinger_response,
-
-        // No slash here! Otherwise apps will generate paths like:
-        // /user/storage//foo/bar
-        get "/storage/:userid" => storage_root,
-        put "/storage/:userid" => storage_root,
-        delete "/storage/:userid" => storage_root,
-
-        get "/storage/:userid/*path" => user_node_response,
-        put "/storage/:userid/*path" => user_node_response,
-        delete "/storage/:userid/*path" => user_node_response,
-
-        get "/dashboard/icon" => icon_proxy,
-        get "/dashboard/" => user_dashboard,
-        post "/dasboard/delete-app" => user_dashboard_delete_app,
-        post "/dashboard/change-password" => user_dashboard_change_password,
-        any "/dashboard/login/" => user_login,
-        any "/dashboard/logout/" => user_logout,
-        any "/dashboard/oauth/:userid/" => oauth_entry,
-
-        get "/" => index
-    };
-
-    let mut mount = mount::Mount::new();
-    mount.mount("/", router);
-    mount.mount("/static/", get_static_handler());
-
-    let mut chain = Chain::new(mount);
-    if config.main.use_proxy_headers { chain.link_before(XForwardedMiddleware); }
-    chain.link(persistent::Read::<AppConfig>::both(config.clone()));
-    chain.link(persistent::State::<AppLock>::both(()));
-    chain.around(SessionStorage::new({
-        let mut rv = SignedCookieBackend::new({
-            println!("Generating session keys...");
-            let mut rng = rand::OsRng::new().unwrap();
-            rng.gen_iter::<u8>().take(64).collect()
-        });
-        rv.set_cookie_modifier(|mut cookie| {
-            cookie.path = Some("/dashboard/".to_owned());
-            cookie
-        });
-        rv
-    }));
-
-    let mut error_router = error_router::ErrorRouter::new();
-    error_router.modifier_for_status(status::NotFound, (
-        status::NotFound,
-        alert_tmpl!("Error 404, content not found.", "/"),
-    ));
-    error_router.modifier_for_status(status::InternalServerError, (
-        status::InternalServerError,
-        alert_tmpl!("Error 500, internal server error.", "/"),
-    ));
-
-    chain.link_after(error_router);
-    chain.link_after(get_template_engine());
-    chain.link_after(SecurityHeaderMiddleware);
-    chain.link_after(ErrorPrinter);
-
-    let listen = &config.main.listen[..];
-    println!("Listening on: http://{}", listen);
-    Iron::new(chain).http(listen).unwrap();
+struct UserLoginParams {
+    
 }
-
-fn user_node_response(req: &mut Request) -> IronResult<Response> {
-    let write_operation = match req.method {
-        Method::Get | Method::Head => false,
-        _ => true
-    };
-
-    let config = req.get::<persistent::Read<AppConfig>>().unwrap();
-    let data_path = &config.main.data_path;
-
-    let (userid, path_str) = {
-        let parts = req.extensions.get::<Router>().unwrap();
-        let userid = parts.find("userid").unwrap().to_owned();
-        let path_str = url::percent_encoding::percent_decode(
-            parts.find("path").unwrap_or("").as_bytes()
-        ).decode_utf8().unwrap().into_owned();
-        (userid, path_str)
-    };
-
-    let user = match models::User::get(data_path, &userid[..]) {
-        Some(x) => x,
-        None => return Ok(Response::with(status::Forbidden))
-    };
-
-    let access_token = match req.headers.get::<header::Authorization<header::Bearer>>() {
-        Some(x) => Some(x.token.clone()),
-        None => None
-    };
-
-    let permissions = user.permissions(&path_str[..], access_token.as_ref().map(Deref::deref));
-
-    if !permissions.can_read || (write_operation && !permissions.can_write) {
-        return Ok(Response::with(status::Forbidden))
-    }
-
-    let lock = req.get::<persistent::State<AppLock>>().unwrap().clone();
-    let _guard = if write_operation {
-        (None, Some(lock.write().unwrap()))
-    } else {
-        (Some(lock.read().unwrap()), None)
-    };
-
-    if path_str.is_empty() || path_str.ends_with('/') {
-        match models::UserFolder::from_path(&user, &path_str[..]) {
-            Some(x) => x.respond(req),
-            None => Ok(Response::with(status::BadRequest))
-        }
-    } else {
-        match models::UserFile::from_path(&user, &path_str[..]) {
-            Some(x) => x.respond(req),
-            None => Ok(Response::with(status::BadRequest))
-        }
-    }
-}
-
 fn user_login(request: &mut Request) -> IronResult<Response> {
     let url = request.get_ref::<urlencoded::UrlEncodedQuery>().ok()
         .and_then(|query| query.get("redirect_to"))
@@ -318,6 +250,7 @@ fn user_logout(request: &mut Request) -> IronResult<Response> {
        .set(Redirect(url_for!(request, "index"))))
 }
 
+#[get("/dashboard")]
 fn user_dashboard(request: &mut Request) -> IronResult<Response> {
     let user = require_login!(request);
 
@@ -331,6 +264,7 @@ fn user_dashboard(request: &mut Request) -> IronResult<Response> {
     )))
 }
 
+#[post("/dashboard/delete-app")]
 fn user_dashboard_delete_app(request: &mut Request) -> IronResult<Response> {
     let user = require_login!(request);
     check_csrf!(request);
@@ -345,6 +279,7 @@ fn user_dashboard_delete_app(request: &mut Request) -> IronResult<Response> {
     )))
 }
 
+#[post("/dashboard/change-password")]
 fn user_dashboard_change_password(request: &mut Request) -> IronResult<Response> {
     static BACK_TO: &'static str = "/dashboard/#change-password";
 
@@ -390,11 +325,8 @@ fn user_dashboard_change_password(request: &mut Request) -> IronResult<Response>
     )))
 }
 
-fn oauth_entry(request: &mut Request) -> IronResult<Response> {
-    let oauth_userid = {
-        let parts = request.extensions.get::<Router>().unwrap();
-        parts.find("userid").unwrap().to_owned()
-    };
+#[get("/dashboard/oauth/<oauth_userid>")]
+fn oauth_entry(oauth_request: oauth::OauthRequest, oauth_userid: &str) -> IronResult<Response> {
     let user = require_login_as!(request, &oauth_userid[..]);
     let oauth_request = match oauth::OauthRequest::from_http(request) {
         Ok(x) => x,
@@ -442,70 +374,6 @@ fn oauth_entry(request: &mut Request) -> IronResult<Response> {
         },
         _ => Ok(Response::with(status::BadRequest))
     }
-}
-
-
-fn webfinger_response(request: &mut Request) -> IronResult<Response> {
-    let url: &url::Url = request.url.as_ref();
-    let query = url.query_pairs().collect::<collections::BTreeMap<_, _>>();
-
-    let userid = iexpect!(
-        query.get("resource")
-        .and_then(|x| if x.starts_with("acct:") {
-            Some(&x[5..x.find('@').unwrap_or(x.len())])
-        } else {
-            None
-        })
-    );
-
-    let storage_url = url_for!(request, "storage_root", "userid" => userid);
-    let oauth_url = url_for!(request, "oauth_entry", "userid" => userid);
-
-    let mut json = serde_json::Map::new();
-    json.insert("links".to_owned(), {
-        let mut rv = vec![];
-        // We need to provide an older webfinger response because remoteStorage.js doesn't
-        // support newer ones.
-        // https://github.com/remotestorage/remotestorage.js/pull/899
-        // https://github.com/silverbucket/webfinger.js/pull/11
-        for &(rel, version) in &[
-            ("http://tools.ietf.org/id/draft-dejong-remotestorage", "draft-dejong-remotestorage-05"),
-            ("remotestorage", "draft-dejong-remotestorage-02")
-        ] {
-            rv.push(json!({
-                "href": storage_url.as_ref().as_str(),
-                "rel": rel,
-                "properties": {
-                    // Spec version
-                    "http://remotestorage.io/spec/version": version,
-
-                    // OAuth as in draft-06
-                    "http://tools.ietf.org/html/rfc6749#section-4.2": oauth_url.as_ref().as_str(),
-
-                    // No support for providing the access token via URL query param as in
-                    // draft-06
-                    "http://tools.ietf.org/html/rfc6750#section-2.3": (),
-
-                    // No Content-Range as in draft-02
-                    "http://tools.ietf.org/html/rfc2616#section-14.16": (),
-
-                    // No Content-Range as in draft-06
-                    "http://tools.ietf.org/html/rfc7233": (),
-
-                    // No web authoring as in draft-06
-                    "http://remotestorage.io/spec/web-authoring": ()
-                }
-            }));
-        };
-        serde_json::Value::Array(rv)
-    });
-
-
-    Ok(Response::with((
-        status::Ok,
-        Header(header::ContentType("application/jrd+json".parse().unwrap())),
-        serde_json::to_string(&json).unwrap()
-    )))
 }
 
 trait UserNodeResponder where Self: Sized {
@@ -698,6 +566,7 @@ impl Login {
     }
 }
 
+#[get("/dashboard/icon")]
 fn icon_proxy(request: &mut Request) -> IronResult<Response> {
     require_login!(request);
     let url = iexpect!(request.get_ref::<urlencoded::UrlEncodedQuery>().ok()
@@ -717,4 +586,66 @@ fn icon_proxy(request: &mut Request) -> IronResult<Response> {
     );
     itry!(icon.fetch());
     Ok(Response::with((status::Ok, icon.mime_type.unwrap(), icon.raw.unwrap())))
+}
+
+pub fn run_server(config: config::Config) {
+    let rocket_builder = rocket::build()
+        .mount("/", vec![index, cors, webfinger_response,
+            // /storage
+            get_storage_root, put_storage_root, delete_storage_root, 
+            // /dashboard
+            icon_proxy, user_dashboard, user_dashboard_delete_app, user_dashboard_change_password, user_login, user_logout, oauth_entry])
+        .mount("/static/", generate_static_routes)
+        .attach(Template::fairing())
+        .manage(config.clone())
+        .manage(AppLock{});
+
+    let router = myrouter! {
+        get "/dashboard/icon" => icon_proxy,
+        get "/dashboard/" => user_dashboard,
+        post "/dasboard/delete-app" => user_dashboard_delete_app,
+        post "/dashboard/change-password" => user_dashboard_change_password,
+        any "/dashboard/login/" => user_login,
+        any "/dashboard/logout/" => user_logout,
+        any "/dashboard/oauth/:userid/" => oauth_entry,
+
+        get "/" => index
+    };
+
+
+    let mut chain = Chain::new(mount);
+    if config.main.use_proxy_headers { chain.link_before(XForwardedMiddleware); }
+    chain.link(persistent::Read::<AppConfig>::both(config.clone()));
+    chain.link(persistent::State::<AppLock>::both(()));
+    chain.around(SessionStorage::new({
+        let mut rv = SignedCookieBackend::new({
+            println!("Generating session keys...");
+            let mut rng = rand::rngs::OsRng::new().unwrap();
+            rng.gen_iter::<u8>().take(64).collect()
+        });
+        rv.set_cookie_modifier(|mut cookie| {
+            cookie.path = Some("/dashboard/".to_owned());
+            cookie
+        });
+        rv
+    }));
+
+    let mut error_router = error_router::ErrorRouter::new();
+    error_router.modifier_for_status(status::NotFound, (
+        status::NotFound,
+        alert_tmpl!("Error 404, content not found.", "/"),
+    ));
+    error_router.modifier_for_status(status::InternalServerError, (
+        status::InternalServerError,
+        alert_tmpl!("Error 500, internal server error.", "/"),
+    ));
+
+    chain.link_after(error_router);
+    chain.link_after(get_template_engine());
+    chain.link_after(SecurityHeaderMiddleware);
+    chain.link_after(ErrorPrinter);
+
+    let listen = &config.main.listen[..];
+    println!("Listening on: http://{}", listen);
+    Iron::new(chain).http(listen).unwrap();
 }

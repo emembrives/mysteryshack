@@ -5,7 +5,7 @@ use std::path;
 
 use toml;
 
-use utils::ServerError;
+use crate::utils::ServerError;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -23,10 +23,10 @@ impl Config {
     pub fn read_file(path: &path::Path) -> Result<Self, ServerError> {
         let path = &env::current_dir().unwrap().join(path);
         let mut s = String::new();
-        let mut f = try!(fs::File::open(path));
-        try!(f.read_to_string(&mut s));
-        let mut rv: Self = try!(toml::from_str(&s));
-        rv.main.data_path = try!(rv.main.data_path.canonicalize());
+        let mut f = fs::File::open(path)?;
+        f.read_to_string(&mut s)?;
+        let mut rv: Self = toml::from_str(&s)?;
+        rv.main.data_path = rv.main.data_path.canonicalize()?;
         Ok(rv)
     }
 }

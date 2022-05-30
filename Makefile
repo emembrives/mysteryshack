@@ -10,7 +10,7 @@ APP_BINARY=./target/debug/mysteryshack
 TEST_CMD=$(APP_BINARY) -c $(TMP_DIR)/config
 PROXY_SERVERS=false
 
-all: libsodium
+all:
 	$(MAKE) release-build
 
 release-build:

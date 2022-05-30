@@ -2,15 +2,12 @@ use std::collections;
 use std::fmt;
 use std::error::Error as ErrorTrait;
 
+use rocket::Request;
+use rocket::request::FromRequest;
+use rocket::request::Outcome;
 use serde::{Serialize,Deserialize,Serializer,Deserializer};
 
-use hyper::header;
-
 use url;
-
-use iron::prelude::*;
-use iron::modifiers::Header;
-use iron::status;
 
 use urlencoded;
 
@@ -78,7 +75,7 @@ impl PermissionsMap {
     }
 }
 
-impl Deserialize for PermissionsMap {
+impl Deserialize<'_> for PermissionsMap {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where D: Deserializer {
         collections::HashMap::<String, CategoryPermissions>::deserialize(deserializer).map(|x| {
@@ -112,9 +109,10 @@ fn expect_param(query: &urlencoded::QueryMap, key: &str) -> Result<String, Error
 }
 
 
-impl OauthRequest {
-    pub fn from_http(request: &mut Request) -> Result<Self, Error> {
-        let query = match request.get_ref::<urlencoded::UrlEncodedQuery>().ok() {
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for OauthRequest {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+    let query = match request.get_ref::<urlencoded::UrlEncodedQuery>().ok() {
             Some(x) => x,
             None => return Err({
                 let mut e = Error::new(ErrorKind::InvalidRequest);
@@ -122,10 +120,10 @@ impl OauthRequest {
                 e
             })
         };
-
+        
         let mut rv = OauthRequest {
             session: None,
-            redirect_uri: match url::Url::parse(&try!(expect_param(query, "redirect_uri"))[..]) {
+            redirect_uri: match url::Url::parse(&expect_param(query, "redirect_uri")?[..]) {
                 Ok(x) => x,
                 Err(e) => return Err({
                     let mut ne = Error::new(ErrorKind::InvalidRequest);
@@ -135,10 +133,10 @@ impl OauthRequest {
             },
             state: expect_param(query, "state").ok() 
         };
-
+        
         rv.session = Some(Session {
             client_id: utils::format_origin(&rv.redirect_uri),
-            permissions: match PermissionsMap::from_scope_string(&try!(expect_param(query, "scope"))[..]) {
+            permissions: match PermissionsMap::from_scope_string(&expect_param(query, "scope")?[..]) {
                 Some(x) => x,
                 None => {
                     let mut e = Error::new(ErrorKind::InvalidScope);
@@ -148,10 +146,12 @@ impl OauthRequest {
                 }
             }
         });
-
+        
         Ok(rv)
     }
+}
 
+impl OauthRequest {
     pub fn grant(self, token: String) -> Grant {
         Grant { request: self, token: token }
     }
@@ -244,16 +244,14 @@ pub trait HttpResponder {
     fn get_redirect_uri(&self) -> Option<url::Url>;
     fn get_redirect_uri_params(&self) -> collections::BTreeMap<String, String>;
 
-    fn get_response(&self) -> Option<Response> {
+    fn get_response(&self) -> Option<rocket::response::Redirect> {
         self.get_redirect_uri()
             .map(|mut uri| {
                 uri.set_fragment(
                     Some(&url::form_urlencoded::Serializer::new(String::new())
                     .extend_pairs(self.get_redirect_uri_params())
                     .finish()));
-                Response::with(status::Found)
-                 // Do not use Redirect modifier here, we need to handle custom URI schemes as well
-                 .set(Header(header::Location(uri.to_string())))
+                rocket::response::Redirect::found(uri.to_string())
             })
     }
 }

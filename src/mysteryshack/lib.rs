@@ -9,9 +9,6 @@ extern crate serde;
 
 extern crate base64;
 
-#[macro_use] extern crate iron;
-#[macro_use] extern crate router;
-#[macro_use] extern crate hyper;
 extern crate toml;
 extern crate unicase;
 extern crate atomicwrites;
@@ -21,9 +18,7 @@ extern crate clap;
 #[macro_use] extern crate please_clap;
 extern crate sodiumoxide;
 extern crate rand;
-extern crate persistent;
 extern crate handlebars;
-extern crate handlebars_iron;
 extern crate mount;
 extern crate regex;
 #[macro_use] extern crate quick_error;
@@ -32,9 +27,8 @@ extern crate filetime;
 extern crate chrono;
 extern crate nix;
 extern crate webicon;
-extern crate iron_error_router;
 extern crate termion;
-extern crate iron_sessionstorage;
+#[macro_use] extern crate rocket;
 
 #[cfg(test)]
 extern crate tempdir;

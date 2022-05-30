@@ -1,46 +1,34 @@
-use std::net::IpAddr;
-
 use hyper::header;
-use hyper::method::Method;
 
+use rocket::{Request, Data, Response, request::{FromRequest, Outcome}};
 use url::Position;
 
 use urlencoded;
 
 use unicase::UniCase;
 
-use iron;
-use iron::prelude::*;
-
-use models;
-
-header! { (XForwardedHost, "X-Forwarded-Host") => [String] }
-header! { (XForwardedPort, "X-Forwarded-Port") => [u16] }
-header! { (XForwardedProto, "X-Forwarded-Proto") => [String] }
-header! { (XForwardedFor, "X-Forwarded-For") => (IpAddr)+ }
+use crate::models;
 
 pub struct XForwardedMiddleware;
 
-impl iron::middleware::BeforeMiddleware for XForwardedMiddleware {
-    fn before(&self, request: &mut Request) -> IronResult<()> {
+#[rocket::async_trait]
+impl rocket::fairing::Fairing for XForwardedMiddleware {
+    async fn on_request(&self, request: &mut Request<'_>, _: &mut Data<'_>) {
         macro_rules! h {
-            ($x:path, $n:expr) => {{
-                // FIXME: https://github.com/hyperium/hyper/issues/891
-                let rv = match request.headers.get::<$x>() {
-                    Some(x) => x.0.clone(),
-                    None => match request.headers.get_raw($n) {
-                        Some(raw_val) => panic!("Malformed header: {}: {:?}", $n, raw_val),
-                        None => panic!("Missing header: {:?}. Turn off use_proxy_headers or set proxy headers.", $n)
-                    }
+            ($x:expr) => {{
+                let rv = match request.headers().get_one($x) {
+                    Some(x) => x.clone(),
+                    None => panic!("Missing header: {:?}. Turn off use_proxy_headers or set proxy headers.", $x)
                 };
-                assert!(request.headers.remove::<$x>());
+                assert!(request.headers().remove($x));
                 rv
             }}
         }
-        let host = h!(XForwardedHost, "X-Forwarded-Host");
-        let port = h!(XForwardedPort, "X-Forwarded-Port");
-        let scheme = h!(XForwardedProto, "X-Forwarded-Proto");
-        let remote_addr = h!(XForwardedFor, "X-Forwarded-For")[0];
+
+        let host = h!("X-Forwarded-Host");
+        let port = h!("X-Forwarded-Port");
+        let scheme = h!("X-Forwarded-Proto");
+        let remote_addr = h!("X-Forwarded-For");
 
         {
             let mut url = request.url.as_mut();
@@ -50,26 +38,20 @@ impl iron::middleware::BeforeMiddleware for XForwardedMiddleware {
         }
 
         request.remote_addr.set_ip(remote_addr);
-        Ok(())
     }
 }
 
 pub struct SecurityHeaderMiddleware;
 
-impl iron::middleware::AfterMiddleware for SecurityHeaderMiddleware {
-    fn after(&self, request: &mut Request, mut response: Response) -> IronResult<Response> {
+#[rocket::async_trait]
+impl rocket::fairing::Fairing for SecurityHeaderMiddleware {
+    async fn on_response(&self, request: &mut Request, response: &mut Response<'r>) {
         Self::set_security_headers(request, &mut response);
-        Ok(response)
-    }
-
-    fn catch(&self, request: &mut Request, mut error: IronError) -> IronResult<Response> {
-        Self::set_security_headers(request, &mut error.response);
-        Err(error)
     }
 }
 
 impl SecurityHeaderMiddleware {
-    fn set_security_headers(rq: &Request, r: &mut Response) {
+    fn set_security_headers(rq: &Request, r: &mut Response<'r>) {
         Self::set_cors_headers(rq, r);
         r.headers.set_raw("X-Content-Type-Options", vec![b"nosniff".to_vec()]);
         r.headers.set_raw("X-XSS-Protection", vec![b"1; mode=block".to_vec()]);
@@ -91,7 +73,7 @@ impl SecurityHeaderMiddleware {
     }
 
     /// Required by remoteStorage spec
-    fn set_cors_headers(rq: &Request, r: &mut Response) {
+    fn set_cors_headers(rq: &Request, r: &mut Response<'r>) {
         match &rq.url.path()[0][..] {
             ".well-known" | "storage" => (),
             _ => return
@@ -109,27 +91,32 @@ impl SecurityHeaderMiddleware {
             None => return
         };
 
-        r.headers.set(header::AccessControlAllowOrigin::Value(origin));
-        r.headers.set(header::AccessControlExposeHeaders(vec![
-            UniCase("ETag".to_owned()),
-            UniCase("Content-Length".to_owned())
-        ]));
-        r.headers.set(header::AccessControlAllowMethods(vec![Method::Get, Method::Put, Method::Delete]));
-        r.headers.set(header::AccessControlAllowHeaders(vec![
-            UniCase("Authorization".to_owned()),
-            UniCase("Content-Type".to_owned()),
-            UniCase("Origin".to_owned()),
-            UniCase("If-Match".to_owned()),
-            UniCase("If-None-Match".to_owned()),
-        ]));
+        r.headers.set("Access-Control-Allow-Origin", origin);
+        r.headers.set("Access-Control-Expose-Headers", "ETag, Content-Length".to_owned());
+        r.headers.set("Access-Control-Allow-Methods", "GET, PUT, DELETE");
+        r.headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Origin, If-Match, If-None-Match".to_owned());
     }
 }
 
-pub trait EtagMatcher {
-    fn matches_etag(&self, given: Option<&str>) -> bool;
+enum EtagRequest {
+    IfNoneMatchAny,
+    IfNoneMatchItems(Vec<String>),
+    IfMatchAny,
+    IfMatch_Items(Vec<String>),
 }
 
-impl EtagMatcher for header::IfNoneMatch {
+pub struct EtagMatcher {
+    request: EtagRequest,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for EtagMatcher {
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        req.headers().get("")
+    }
+}
+
+impl EtagMatcher {
     fn matches_etag(&self, given: Option<&str>) -> bool {
         match *self {
             header::IfNoneMatch::Any => given.is_some(),
@@ -158,7 +145,7 @@ impl EtagMatcher for header::IfMatch {
 }
 
 pub fn preconditions_ok(request: &Request, etag: Option<&str>) -> bool {
-    if let Some(header) = request.headers.get::<header::IfNoneMatch>() {
+    if let Some(header) = request.headers.get::<header::IF_NONE_MATCH>() {
         if header.matches_etag(etag) {
             return false
         }
