@@ -1,8 +1,5 @@
-use std::path;
 use std::process;
 use std::str::FromStr;
-
-use sodiumoxide;
 
 use clap::{Command, Arg};
 
@@ -13,7 +10,7 @@ use crate::utils;
 
 
 #[rocket::main]
-async fn main() {
+pub async fn main() {
     let username_arg = Arg::with_name("USERNAME")
         .help("The username to perform the operation with.")
         .required(true)
@@ -24,23 +21,22 @@ async fn main() {
         .version(env!("CARGO_PKG_VERSION"))
         .author("Markus Unterwaditzer & contributors")
         .about("A remoteStorage server.")
-        .args_from_usage("-c, --config=[FILE] 'Use specified config file, defaults to ./config'")
-        .setting(Command::subcommand_required)
-        .subcommand(Command::with_name("serve")
+        .subcommand_required(true)
+        .subcommand(Command::new("serve")
                     .about("Start server"))
-        .subcommand(Command::with_name("user")
+        .subcommand(Command::new("user")
                     .about("User management")
-                    .setting(Command::subcommand_required)
-                    .subcommand(Command::with_name("create")
+                    .subcommand_required(true)
+                    .subcommand(Command::new("create")
                                 .about("Create a new user")
                                 .arg(username_arg.clone()))
-                    .subcommand(Command::with_name("setpass")
+                    .subcommand(Command::new("setpass")
                                 .about("Change password for user")
                                 .arg(username_arg.clone()))
-                    .subcommand(Command::with_name("delete")
+                    .subcommand(Command::new("delete")
                                 .about("Delete a user")
                                 .arg(username_arg.clone()))
-                    .subcommand(Command::with_name("authorize")
+                    .subcommand(Command::new("authorize")
                                 .about("Create a OAuth token. This is mostly useful for development.")
                                 .arg(username_arg.clone())
                                 .arg(Arg::with_name("days")
@@ -51,11 +47,10 @@ async fn main() {
                                 .arg(Arg::with_name("SCOPE").required(true).index(3))))
         .get_matches();
 
-    assert!(sodiumoxide::init());
+    let rocket_builder = rocket::build();
+    let figment = rocket_builder.figment();
 
-    let config_path = path::Path::new(matches.value_of("config").unwrap_or("./config"));
-
-    let config = match config::Config::read_file(config_path) {
+    let config : config::Config = match figment.extract() {
         Ok(x) => x,
         Err(e) => {
             println!("Failed to parse config: {}", e);
@@ -64,18 +59,18 @@ async fn main() {
     };
 
     clap_dispatch!(matches; {
-        serve() => web::run_server(config),
+        serve() => web::run_server(rocket_builder).await,
         user(user_matches) => clap_dispatch!(user_matches; {
             create(_, USERNAME as username) => {
-                if models::User::get(&config.main.data_path, username).is_some() {
+                if models::User::get(&config.absolute_data_path(), username).is_some() {
                     println!("User already exists. Please delete the user first.");
                     process::exit(1);
                 }
 
                 let password_hash = models::PasswordHash::from_password(
-                    utils::double_password_prompt("Password for new user: ").unwrap_or_else(|| process::exit(1)));
+                    &utils::double_password_prompt("Password for new user: ").unwrap_or_else(|| process::exit(1)));
 
-                match models::User::create(&config.main.data_path, username).map(|user| {
+                match models::User::create(&config.absolute_data_path(), username).map(|user| {
                     user.set_password_hash(password_hash)
                 }) {
                     Ok(_) => (),
@@ -88,7 +83,7 @@ async fn main() {
                 println!("Successfully created user {}", username);
             },
             setpass(_, USERNAME as username) => {
-                let user = match models::User::get(&config.main.data_path, username) {
+                let user = match models::User::get(&config.absolute_data_path(), username) {
                     Some(x) => x,
                     None => {
                         println!("User does not exist: {}", username);
@@ -97,7 +92,7 @@ async fn main() {
                 };
 
                 let password_hash = models::PasswordHash::from_password(
-                    utils::double_password_prompt("New password: ").unwrap_or_else(|| process::exit(1)));
+                    &utils::double_password_prompt("New password: ").unwrap_or_else(|| process::exit(1)));
                 match user.set_password_hash(password_hash) {
                     Ok(_) => (),
                     Err(e) => {
@@ -109,7 +104,7 @@ async fn main() {
                 println!("Changed password for user {}", username);
             },
             delete(_, USERNAME as username) => {
-                let user = match models::User::get(&config.main.data_path, username) {
+                let user = match models::User::get(&config.absolute_data_path(), username) {
                     Some(x) => x,
                     None => {
                         println!("User does not exist: {}", username);
@@ -148,7 +143,7 @@ async fn main() {
                     }
                 };
 
-                let user = match models::User::get(&config.main.data_path, username) {
+                let user = match models::User::get(&config.absolute_data_path(), username) {
                     Some(x) => x,
                     None => {
                         println!("User does not exist: {}", username);

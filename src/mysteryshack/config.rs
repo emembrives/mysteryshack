@@ -1,32 +1,17 @@
-use std::env;
-use std::fs;
-use std::io::Read;
-use std::path;
+use std::path::{Path, PathBuf};
 
-use toml;
-
-use crate::utils::ServerError;
-
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 pub struct Config {
-    pub main: MainConfig,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct MainConfig {
-    pub listen: String,
-    pub data_path: path::PathBuf,
+    pub data_path: String,
     pub use_proxy_headers: bool,
+    pub csrf_key: String,
+    pub template_dir: String,
+    pub public_hostname: String,
 }
 
 impl Config {
-    pub fn read_file(path: &path::Path) -> Result<Self, ServerError> {
-        let path = &env::current_dir().unwrap().join(path);
-        let mut s = String::new();
-        let mut f = fs::File::open(path)?;
-        f.read_to_string(&mut s)?;
-        let mut rv: Self = toml::from_str(&s)?;
-        rv.main.data_path = rv.main.data_path.canonicalize()?;
-        Ok(rv)
+    pub fn absolute_data_path(&self) -> PathBuf {
+        let path = Path::new(&self.data_path);
+        path.canonicalize().expect("Unable to canonicalize data_path")
     }
 }

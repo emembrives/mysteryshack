@@ -5,10 +5,11 @@
         <p>The following application wants to access your data:</p>
 
         <div class="app-info">
-            {{> show-app}}
+            {{> show-app }}
         </div>
 
         <form method=post>
+            <input type="hidden" name="csrf" id="csrf" value="{{ token }}" />
             <p>
                 <label for=days>Token valid for</label>
                 <select name="days" size="1">

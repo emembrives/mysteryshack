@@ -8,6 +8,8 @@
 
                 <label for=pass>Password</label>
                 <input type=password name=pass id=pass />
+                <input type="hidden" name="csrf" id="csrf" value="{{ token }}" />
+                <input type="hidden" name="redirect_to" id="redirect_to" value="{{ redirect_to }}" />
 
                 <input type=submit class="pure-button pure-button-primary" value="Log in" />
             </form>

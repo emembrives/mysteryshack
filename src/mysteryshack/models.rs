@@ -1,34 +1,44 @@
-use std::path;
+use std::fs;
 use std::io;
 use std::io::Read;
 use std::io::Write;
-use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::iter::FromIterator;
+use std::path;
 
-use chrono;
-
-use serde_json;
-use base64;
-
-use rand;
-
-use regex;
-
-use sodiumoxide::crypto::{auth,pwhash};
-
+use argon2::password_hash::SaltString;
+use argon2::Argon2;
+use argon2::PasswordHasher;
+use argon2::PasswordVerifier;
 use atomicwrites;
-use time;
+use base64;
+use chrono;
 use filetime;
+use hmac::digest::crypto_common::KeySizeUser;
+use hmac::digest::typenum::Unsigned;
+use hmac::Hmac;
+use hmac::Mac;
 use nix::errno;
-
+use rand;
+use rand::distributions::Alphanumeric;
+use rand::Rng;
+use rand::RngCore;
+use regex;
+use serde_json;
+use sha3::Sha3_256;
 use url;
+
 use crate::utils;
 use crate::utils::ServerError;
-use crate::web::oauth::{PermissionsMap, Session as OauthSession, CategoryPermissions};
+use crate::web::oauth::{CategoryPermissions, PermissionsMap, Session as OauthSession};
+
+type HmacSha256 = Hmac<Sha3_256>;
+const HMAC_KEY_SIZE: usize = <HmacSha256 as KeySizeUser>::KeySize::USIZE;
+type HmacKey = [u8; HMAC_KEY_SIZE];
 
 pub fn is_safe_identifier(string: &str) -> bool {
-    regex::Regex::new(r"^[A-Za-z0-9_-]+$").unwrap().is_match(string)
+    regex::Regex::new(r"^[A-Za-z0-9_-]+$")
+        .unwrap()
+        .is_match(string)
 }
 
 quick_error! {
@@ -41,12 +51,15 @@ quick_error! {
         AlreadyExisting {
             display("Resource already exists.")
         }
+        InvalidPath {
+            display("Invalid path")
+        }
     }
 }
 
 pub struct User {
     pub user_path: path::PathBuf,
-    pub userid: String
+    pub userid: String,
 }
 
 impl User {
@@ -55,7 +68,7 @@ impl User {
         if is_safe_identifier(userid) {
             Ok(User {
                 user_path: basepath.join(userid.to_owned()),
-                userid: userid.to_owned()
+                userid: userid.to_owned(),
             })
         } else {
             Err(Error::InvalidUserName)
@@ -63,12 +76,12 @@ impl User {
     }
 
     pub fn get(basepath: &path::Path, userid: &str) -> Option<User> {
-        User::new_unchecked(basepath, userid)
-            .ok()
-            .and_then(|user| match fs::metadata(user.user_info_path()) {
+        User::new_unchecked(basepath, userid).ok().and_then(|user| {
+            match fs::metadata(user.user_info_path()) {
                 Ok(ref x) if x.is_file() => Some(user),
-                _ => None
-            })
+                _ => None,
+            }
+        })
     }
 
     pub fn create(basepath: &path::Path, userid: &str) -> Result<User, ServerError> {
@@ -95,51 +108,60 @@ impl User {
         let mut f = fs::File::open(self.password_path())?;
         let mut x: Vec<u8> = vec![];
         f.read_to_end(&mut x)?;
-        Ok(PasswordHash {
-            content: pwhash::HashedPassword::from_slice(&x).unwrap()
-        })
+        Ok(PasswordHash::from_hash(&x))
     }
 
     pub fn set_password_hash(&self, hash: PasswordHash) -> io::Result<()> {
         let f = atomicwrites::AtomicFile::new(self.password_path(), atomicwrites::AllowOverwrite);
-        f.write(|f| f.write_all(&hash.content[..]))?;
+        f.write(|f| f.write_all(&hash.content.as_bytes()[..]))?;
         Ok(())
     }
 
-    fn user_info_path(&self) -> path::PathBuf { self.user_path.join("user.json") }
-    fn password_path(&self) -> path::PathBuf { self.user_path.join("password") }
-    pub fn data_path(&self) -> path::PathBuf { self.user_path.join("data/") }
-    pub fn meta_path(&self) -> path::PathBuf { self.user_path.join("meta/") }
-    pub fn tmp_path(&self) -> path::PathBuf { self.user_path.join("tmp/") }
-    pub fn apps_path(&self) -> path::PathBuf { self.user_path.join("apps/") }
+    fn user_info_path(&self) -> path::PathBuf {
+        self.user_path.join("user.json")
+    }
+    fn password_path(&self) -> path::PathBuf {
+        self.user_path.join("password")
+    }
+    pub fn data_path(&self) -> path::PathBuf {
+        self.user_path.join("data/")
+    }
+    pub fn meta_path(&self) -> path::PathBuf {
+        self.user_path.join("meta/")
+    }
+    pub fn tmp_path(&self) -> path::PathBuf {
+        self.user_path.join("tmp/")
+    }
+    pub fn apps_path(&self) -> path::PathBuf {
+        self.user_path.join("apps/")
+    }
 
-    pub fn key_path(&self) -> path::PathBuf { self.user_path.join("user.key") }
+    pub fn key_path(&self) -> path::PathBuf {
+        self.user_path.join("user.key")
+    }
 
     pub fn walk_apps(&self) -> io::Result<Vec<App>> {
         let mut rv = vec![];
         for entry in fs::read_dir(self.apps_path())? {
             let entry = entry?;
             if entry.metadata()?.is_dir() {
-                rv.push(
-                    App::get(
-                        self,
-                        &entry.file_name().into_string().unwrap()
-                    ).unwrap()
-                );
+                rv.push(App::get(self, &entry.file_name().into_string().unwrap()).unwrap());
             };
-        };
+        }
         Ok(rv)
     }
 
     pub fn permissions(&self, path: &str, token: Option<&str>) -> CategoryPermissions {
         let anonymous = CategoryPermissions {
             can_read: path.starts_with("public/") && !path.ends_with('/'),
-            can_write: false
+            can_write: false,
         };
 
         let (_, session) = match token.and_then(|t| Token::get(self, t)) {
             Some(x) => x,
-            None => return anonymous
+            None => {
+                return anonymous
+            },
         };
 
         let category = {
@@ -150,24 +172,30 @@ impl User {
             rv
         };
 
-        *session.permissions.permissions_for_category(category).unwrap_or(&anonymous)
+        *session
+            .permissions
+            .permissions_for_category(category)
+            .unwrap_or_else(|| {
+                &anonymous
+            })
     }
 
-    pub fn get_key(&self) -> auth::Key {
+    pub fn get_key(&self) -> HmacKey {
         let mut f = fs::File::open(self.key_path()).unwrap();
         let mut s = vec![];
         f.read_to_end(&mut s).unwrap();
-        auth::Key::from_slice(&s).unwrap()
+        s.try_into().unwrap()
     }
 
     pub fn new_key(&self) -> io::Result<()> {
-        let key = auth::gen_key();
+        let mut key: HmacKey = [0; HMAC_KEY_SIZE];
+        rand::rngs::OsRng::default().fill_bytes(&mut key);
         let f = atomicwrites::AtomicFile::new(self.key_path(), atomicwrites::AllowOverwrite);
-        f.write(|f| f.write_all(&key.0))?;
+        f.write(|f| f.write_all(&key))?;
 
         for app in self.walk_apps()? {
             app.delete()?;
-        };
+        }
 
         Ok(())
     }
@@ -176,7 +204,7 @@ impl User {
 pub struct App<'a> {
     pub client_id: String,
     pub app_id: String,
-    pub user: &'a User
+    pub user: &'a User,
 }
 
 impl<'a> App<'a> {
@@ -199,13 +227,16 @@ impl<'a> App<'a> {
 
     pub fn get(u: &'a User, client_id: &str) -> Option<App<'a>> {
         let p = App::get_path(u, client_id).join("app_id");
-        let mut f = match fs::File::open(p) { Ok(x) => x, Err(_) => return None };
+        let mut f = match fs::File::open(p) {
+            Ok(x) => x,
+            Err(_) => return None,
+        };
 
         let app_id = {
             let mut rv = String::new();
             match f.read_to_string(&mut rv) {
                 Ok(_) => (),
-                Err(_) => return None
+                Err(_) => return None,
             };
             rv
         };
@@ -213,7 +244,7 @@ impl<'a> App<'a> {
         Some(App {
             user: u,
             client_id: App::normalize_client_id(client_id),
-            app_id: app_id
+            app_id: app_id,
         })
     }
 
@@ -222,25 +253,22 @@ impl<'a> App<'a> {
     }
 
     pub fn create(u: &'a User, client_id: &str) -> Result<App<'a>, io::Error> {
-        let app_id = {
-            let mut rng = rand::rngs::OsRng::new()?;
-            String::from_iter(rng.gen_ascii_chars().take(64))
+        let app_id: String = {
+            let mut rng = rand::rngs::OsRng::default();
+            (0..64).map(|_| rng.sample(Alphanumeric) as char).collect()
         };
 
         let p = App::get_path(u, client_id);
         fs::create_dir_all(&p)?;
 
-        let f = atomicwrites::AtomicFile::new(
-            p.join("app_id"),
-            atomicwrites::DisallowOverwrite
-        );
+        let f = atomicwrites::AtomicFile::new(p.join("app_id"), atomicwrites::DisallowOverwrite);
 
         f.write(|f| f.write_all(app_id.as_bytes()))?;
 
         Ok(App {
             user: u,
             client_id: client_id.to_owned(),
-            app_id: app_id
+            app_id: app_id,
         })
     }
 }
@@ -261,7 +289,7 @@ pub struct Token {
     // The client_id as specified in OAuth and remoteStorage specifications. In our case it is
     // always the Origin.
     pub client_id: String,
-    pub permissions: PermissionsMap
+    pub permissions: PermissionsMap,
 }
 
 impl Token {
@@ -269,30 +297,31 @@ impl Token {
         let key = u.get_key();
 
         let token: Self = {
-            let mut token_parts = token.split('.')
-                .map(|x| base64::decode(x));
-            let payload = match token_parts.next() { Some(Ok(x)) => x, _ => return None };
-
-            let tag = match token_parts.next() {
-                Some(Ok(x)) => match auth::Tag::from_slice(&x) {
-                    Some(x) => x,
-                    None => return None
-                },
-                _ => return None
+            let mut token_parts = token.split('.').map(|x| base64::decode(x));
+            let payload = match token_parts.next() {
+                Some(Ok(x)) => x,
+                _ => return None,
             };
 
-            if !auth::verify(&tag, &payload, &key) {
-                return None
+            let tag = match token_parts.next() {
+                Some(Ok(x)) => x,
+                _ => return None,
+            };
+
+            let mut hmac = HmacSha256::new_from_slice(&key).unwrap();
+            hmac.update(&payload);
+            if !hmac.verify_slice(&tag).is_ok() {
+                return None;
             };
 
             let payload_string = match String::from_utf8(payload) {
                 Ok(x) => x,
-                Err(_) => return None
+                Err(_) => return None,
             };
 
             match serde_json::from_str(&payload_string) {
                 Ok(x) => x,
-                Err(_) => return None
+                Err(_) => return None,
             }
         };
 
@@ -305,73 +334,91 @@ impl Token {
 
         let app = match App::get(u, &token.client_id[..]) {
             Some(app) => {
-                if app.app_id == token.app_id { app }
-                else { return None }
-            },
-            _ => return None
+                if app.app_id == token.app_id {
+                    app
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
         };
 
         Some((app, token))
     }
 
-    pub fn create(u: &User, sess: OauthSession, days: Option<u64>) -> Result<(App, Self), ServerError> {
+    pub fn create(
+        u: &User,
+        sess: OauthSession,
+        days: Option<u64>,
+    ) -> Result<(App, Self), ServerError> {
         let app = match App::get(u, &sess.client_id) {
             Some(x) => x,
-            None => App::create(u, &sess.client_id)?
+            None => App::create(u, &sess.client_id)?,
         };
 
         let app_id_cp = app.app_id.clone();
 
-        Ok((app, Token {
-            app_id: app_id_cp,
-            client_id: sess.client_id,
-            permissions: sess.permissions,
-            exp: days.map(|d| {
-                (chrono::offset::Utc::now() + chrono::Duration::days(d as i64)).timestamp()
-            })
-        }))
+        Ok((
+            app,
+            Token {
+                app_id: app_id_cp,
+                client_id: sess.client_id,
+                permissions: sess.permissions,
+                exp: days.map(|d| {
+                    (chrono::offset::Utc::now() + chrono::Duration::days(d as i64)).timestamp()
+                }),
+            },
+        ))
     }
 
     pub fn token(&self, u: &User) -> String {
         let key = u.get_key();
         let payload_string = serde_json::to_string(self).unwrap();
         let payload = payload_string.as_bytes();
-        let tag = auth::authenticate(payload, &key);
+        let mut hmac = HmacSha256::new_from_slice(&key).unwrap();
+        hmac.update(payload);
+        let tag = hmac.finalize().into_bytes();
 
         {
             let mut rv = String::new();
             rv.push_str(&base64::encode(payload));
             rv.push('.');
-            rv.push_str(&base64::encode(&tag.0));
+            rv.push_str(&base64::encode(&tag));
             rv
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug)]
 pub struct PasswordHash {
-    content: pwhash::HashedPassword
+    content: password_hash::PasswordHashString,
 }
 
 impl PasswordHash {
-    pub fn from_password(pwd: String) -> PasswordHash {
+    pub fn from_password(pwd: &str) -> PasswordHash {
+        let salt = SaltString::generate(&mut rand::rngs::OsRng);
+        let hashed_password = Argon2::default().hash_password(pwd.as_bytes(), &salt).unwrap();
         PasswordHash {
-            content: pwhash::pwhash(pwd.as_bytes(), 
-                pwhash::OPSLIMIT_INTERACTIVE,
-                pwhash::MEMLIMIT_INTERACTIVE).unwrap()
+            content: hashed_password.into(),
         }
     }
 
-    pub fn equals_password<T: AsRef<[u8]>>(&self, pwd: T) -> bool {
-        pwhash::pwhash_verify(&self.content, pwd.as_ref())
+    pub fn from_hash(hash: &[u8]) -> PasswordHash {
+        PasswordHash{
+            content: password_hash::PasswordHashString::new(&String::from_utf8(hash.to_vec()).unwrap()).unwrap()
+        }
+    }
+
+    pub fn equals_password(&self, pwd: &[u8]) -> bool {
+        Argon2::default().verify_password(pwd, &self.content.password_hash()).is_ok()
     }
 }
 
-
-
 pub trait UserNode<'a> {
-    fn from_path(user: &'a User, path: &str) -> Option<Self> where Self: Sized;
-    
+    fn from_path(user: &'a User, path: &str) -> Option<Self>
+    where
+        Self: Sized;
+
     // Get frontent-facing path relative to root
     fn get_path(&self) -> &str;
     fn get_basename(&self) -> String;
@@ -393,17 +440,17 @@ pub trait UserNode<'a> {
 #[derive(Serialize, Deserialize)]
 pub struct UserFileMeta {
     pub content_type: String,
-    pub content_length: u64
+    pub content_length: u64,
 }
 
 pub struct UserFile<'a> {
     pub user: &'a User,
     pub path: String,
     data_path: path::PathBuf,
-    meta_path: path::PathBuf
+    meta_path: path::PathBuf,
 }
 
-impl<'a> UserFile<'a> { 
+impl<'a> UserFile<'a> {
     pub fn read_meta(&self) -> Result<UserFileMeta, ServerError> {
         utils::read_json_file(&self.meta_path)
     }
@@ -419,7 +466,7 @@ impl<'a> UserFile<'a> {
         Ok(atomicwrites::AtomicFile::new_with_tmpdir(
             &self.data_path,
             atomicwrites::AllowOverwrite,
-            &self.user.tmp_path()
+            &self.user.tmp_path(),
         ))
     }
 
@@ -427,27 +474,21 @@ impl<'a> UserFile<'a> {
         utils::write_json_file(meta, &self.meta_path)?;
         match self.touch_parents() {
             Ok(_) => (),
-            Err(e) => println!("Failed to touch parent directories: {:?}", e)
+            Err(e) => println!("Failed to touch parent directories: {:?}", e),
         };
         Ok(())
     }
 
     fn touch_parents(&self) -> io::Result<()> {
-        let timestamp = {
-            // Stolen from https://github.com/uutils/coreutils/blob/master/src/touch/touch.rs
-            let t = time::Instant::now().to_timespec();
-            filetime::FileTime::from_seconds_since_1970(
-                t.sec as u64,
-                t.nsec as u32
-            )
-        };
+        let timestamp = filetime::FileTime::now();
 
         utils::map_parent_dirs(&self.data_path, self.user.data_path(), |p| {
             filetime::set_file_times(p, timestamp, timestamp).map(|_| true)
-        }).map(|_| ())
+        })
+        .map(|_| ())
     }
 
-    pub fn delete(self) -> io::Result<()> {
+    pub fn delete(&mut self) -> io::Result<()> {
         fn f(p: &path::Path) -> io::Result<bool> {
             match fs::remove_dir(p) {
                 Err(e) => {
@@ -458,30 +499,32 @@ impl<'a> UserFile<'a> {
                     }
                     println!("Failed to remove directory during cleanup: {:?}", e);
                     Err(e)
-                },
-                Ok(_) => Ok(true)
+                }
+                Ok(_) => Ok(true),
             }
         }
 
-        fs::remove_file(&self.data_path);
-        fs::remove_file(&self.meta_path);
-        utils::map_parent_dirs(&self.data_path, self.user.data_path(), f);
-        utils::map_parent_dirs(&self.meta_path, self.user.meta_path(), f);
+        fs::remove_file(&self.data_path)?;
+        fs::remove_file(&self.meta_path)?;
+        utils::map_parent_dirs(&self.data_path, self.user.data_path(), f)?;
+        utils::map_parent_dirs(&self.meta_path, self.user.meta_path(), f)?;
         Ok(())
     }
 }
 
 impl<'a> UserNode<'a> for UserFile<'a> {
     fn from_path(user: &'a User, path: &str) -> Option<UserFile<'a>> {
-        if path.ends_with('/') { return None; };
+        if path.ends_with('/') {
+            return None;
+        };
 
         let data_path = match utils::safe_join(user.data_path(), path) {
             Some(x) => x,
-            None => return None
+            None => return None,
         };
         let meta_path = match utils::safe_join(user.meta_path(), path) {
             Some(x) => x,
-            None => return None
+            None => return None,
         };
 
         Some(UserFile {
@@ -491,20 +534,26 @@ impl<'a> UserNode<'a> for UserFile<'a> {
             user: user,
         })
     }
-    fn get_user(&self) -> &User { self.user }
-    
-    fn get_path(&self) -> &str { &self.path }
+    fn get_user(&self) -> &User {
+        self.user
+    }
+
+    fn get_path(&self) -> &str {
+        &self.path
+    }
     fn get_basename(&self) -> String {
         self.path.rsplitn(2, '/').nth(0).unwrap().to_owned()
     }
-    fn get_fs_path(&self) -> &path::Path { self.data_path.as_path() }
-    
+    fn get_fs_path(&self) -> &path::Path {
+        self.data_path.as_path()
+    }
+
     fn json_repr(&self) -> Result<serde_json::Value, ServerError> {
-        let meta = self.read_meta();
+        let meta = self.read_meta()?;
         Ok(json!({
             "Content-Type": meta.content_type,
             "Content-Length": meta.content_length,
-            "ETag": self.read_etag()
+            "ETag": self.read_etag()?
         }))
     }
 }
@@ -512,12 +561,12 @@ impl<'a> UserNode<'a> for UserFile<'a> {
 pub struct UserFolder<'a> {
     pub user: &'a User,
     data_path: path::PathBuf,
-    path: String
+    path: String,
 }
 
 impl<'a> UserFolder<'a> {
     pub fn read_children<'b>(&'b self) -> Result<Vec<Box<dyn UserNode + 'b>>, ServerError> {
-        let mut rv: Vec<Box<UserNode>> = vec![];
+        let mut rv: Vec<Box<dyn UserNode>> = vec![];
         for entry in fs::read_dir(&self.data_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -525,16 +574,19 @@ impl<'a> UserFolder<'a> {
             let fname_string = entry.file_name();
             let fname_str = fname_string.to_str().unwrap();
 
+            let entry_path = match std::path::Path::new(&self.path).join(fname_str).to_str() {
+                Some(e) => e.to_owned(),
+                None => return Err(ServerError::Model(Error::InvalidPath))
+            };
             if meta.is_dir() {
-                rv.push(Box::new(UserFolder::from_path(
-                    self.user,
-                    &(self.path.clone() + fname_str + "/")
-                ).unwrap()));
+                rv.push(Box::new(
+                    UserFolder::from_path(self.user, &(entry_path + "/"))
+                        .unwrap(),
+                ));
             } else if !fname_str.starts_with(".~") {
-                rv.push(Box::new(UserFile::from_path(
-                    self.user,
-                    &(self.path.clone() + fname_str)
-                ).unwrap()));
+                rv.push(Box::new(
+                    UserFile::from_path(self.user, &entry_path).unwrap(),
+                ));
             }
         }
         Ok(rv)
@@ -544,26 +596,28 @@ impl<'a> UserFolder<'a> {
 impl<'a> UserNode<'a> for UserFolder<'a> {
     fn from_path(user: &'a User, path: &str) -> Option<UserFolder<'a>> {
         Some(UserFolder {
-            path: if path.ends_with('/') || path.is_empty() {
-                path.to_owned()
-            } else {
-                return None
-            },
+            path: path.to_owned(),
             data_path: match utils::safe_join(user.data_path(), path) {
                 Some(x) => x,
-                None => return None
+                None => return None,
             },
-            user: user
+            user: user,
         })
     }
 
-    fn get_path(&self) -> &str { &self.path }
-    fn get_user(&self) -> &User { self.user }
+    fn get_path(&self) -> &str {
+        &self.path
+    }
+    fn get_user(&self) -> &User {
+        self.user
+    }
     fn get_basename(&self) -> String {
         self.path.rsplitn(3, '/').nth(1).unwrap().to_owned() + "/"
     }
 
-    fn get_fs_path(&self) -> &path::Path { self.data_path.as_path() }
+    fn get_fs_path(&self) -> &path::Path {
+        self.data_path.as_path()
+    }
 
     fn json_repr(&self) -> Result<serde_json::Value, ServerError> {
         Ok(json!({
@@ -572,34 +626,73 @@ impl<'a> UserNode<'a> for UserFolder<'a> {
     }
 }
 
+pub enum UserNodeFromPath<'a> {
+    None,
+    UserFolder(UserFolder<'a>),
+    UserFile(UserFile<'a>),
+}
+
+pub fn user_node_from_path<'a>(user: &'a User, path: &str) -> UserNodeFromPath<'a> {
+    if path.ends_with('/') || path.is_empty() {
+        match UserFolder::from_path(user, path) {
+            Some(f) => return UserNodeFromPath::UserFolder(f),
+            None => return UserNodeFromPath::None,
+        };
+    }
+
+    let data_path= match utils::safe_join(user.data_path(), path) {
+        Some(x) => x,
+        None => return UserNodeFromPath::None,
+    };
+
+    match std::fs::read_dir(data_path) {
+        Ok(_) => match UserFolder::from_path(user, path) {
+            Some(f) => UserNodeFromPath::UserFolder(f),
+            None => UserNodeFromPath::None,
+        }
+        Err(_) => match UserFile::from_path(user, path) {
+            Some(f) => UserNodeFromPath::UserFile(f),
+            None => UserNodeFromPath::None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use utils::ServerError;
-    use crate::web::oauth::Session as OauthSession;
     use crate::web::oauth::CategoryPermissions;
     use crate::web::oauth::PermissionsMap;
-    use tempdir::TempDir;
+    use crate::web::oauth::Session as OauthSession;
     use std::collections;
+    use tempdir::TempDir;
+    use utils::ServerError;
 
     fn get_tmp() -> TempDir {
         TempDir::new("mysteryshack").unwrap()
     }
 
     fn get_root_token<'a>(u: &'a User) -> (App<'a>, Token) {
-        Token::create(&u, OauthSession {
-            client_id: "http://example.com".to_owned(),
-            permissions: PermissionsMap {
-                permissions: {
-                    let mut rv = collections::HashMap::new();
-                    rv.insert("".to_owned(), CategoryPermissions {
-                        can_read: true,
-                        can_write: true
-                    });
-                    rv
-                }
-            }
-        }, Some(30)).unwrap()
+        Token::create(
+            &u,
+            OauthSession {
+                client_id: "http://example.com".to_owned(),
+                permissions: PermissionsMap {
+                    permissions: {
+                        let mut rv = collections::HashMap::new();
+                        rv.insert(
+                            "".to_owned(),
+                            CategoryPermissions {
+                                can_read: true,
+                                can_write: true,
+                            },
+                        );
+                        rv
+                    },
+                },
+            },
+            Some(30),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -609,7 +702,7 @@ mod tests {
 
         match User::create(t.path(), "foo") {
             Err(ServerError::Model(Error::AlreadyExisting)) => (),
-            _ => panic!("User creation successful.")
+            _ => panic!("User creation successful."),
         };
     }
 

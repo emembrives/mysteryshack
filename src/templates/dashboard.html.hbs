@@ -44,6 +44,8 @@
         <h2 id="change-password">Changing password</h2>
 
         <form method=post action=change-password class="pure-form pure-form-stacked">
+            <input type="hidden" name="csrf" id="csrf" value="{{ token }}" />
+ 
             <label for=current_pass>Current password</label>
             <input type=password name=current_pass />
 

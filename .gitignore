@@ -6,3 +6,4 @@ tests/spec/suite
 local
 data
 libsodium
+Rocket.toml

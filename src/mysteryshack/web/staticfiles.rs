@@ -1,26 +1,26 @@
 // Generated using scripts/make_static.py. Do NOT edit directly!
 
-use rocket::{Route, http::ContentType};
+use std::borrow::Cow;
+
+use rocket::http::{ContentType, Status};
 use rust_embed::RustEmbed;
-use rocket::http::Method::Get;
 
 #[derive(RustEmbed)]
 #[folder = "src/static/"]
 struct Asset;
 
-pub fn generate_static_routes() -> Vec<Route> {
-    let mut routes = Vec::<Route>::new();
-    for file in Asset::iter() {
-        let content_type = match file.split(".").last() {
-            Some("css") => ContentType::CSS,
-            Some("svg") => ContentType::SVG,
-            _ => panic!("Unknown file type")
-        };
-        routes.push(
-            Route::new(Get, "/" + file, |content_type, file| {
-                (content_type, Asset::get(file))
-            })
-        )
-    }
-    routes
+#[get("/<filename>")]
+pub fn static_route<'a>(filename: &'a str) -> Result<(ContentType, Cow<'static, [u8]>), Status> {
+    let asset = match Asset::get(&filename) {
+        Some(a) => a,
+        None => return Err(Status::NotFound),
+    };
+
+    let content_type = match filename.split(".").last() {
+        Some("css") => ContentType::CSS,
+        Some("svg") => ContentType::SVG,
+        _ => panic!("Unknown file type"),
+    };
+
+    Ok((content_type, asset.data.to_owned()))
 }
